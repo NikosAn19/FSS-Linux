@@ -5,8 +5,8 @@
 #   listAll, listMonitored, listStopped, purge
 #
 # Χρήση: ./fss_script.sh -p <path> -c <command>
-# Όπου το path είναι είτε το log file είτε ένας target κατάλογος και
-# το command μία από τις παραπάνω εντολές.
+# Όπου το path είναι είτε το log file (manager.log ή console.log) είτε ένας target κατάλογος
+# και το command μία από τις παραπάνω εντολές.
 
 usage() {
     echo "Usage: $0 -p <path> -c <command>"
@@ -32,21 +32,19 @@ case "$command" in
             exit 1
         fi
         echo "Listing all directories from log file:"
-        # Αναζητούμε τις γραμμές όπου προστέθηκε καταχώρηση (π.χ., "Added directory:")
-        # και επιχειρούμε να εξάγουμε το source, το target, την τελευταία φορά συγχρονισμού
-        # και το status (βάσει των εκτυπωμένων exec_report).
-        grep "Added directory:" "$path" | while read line; do
-            # Παράδειγμα log: 
-            # [2025-02-10 10:00:01] Added directory: /home/user/docs -> /backup/docs (Worker PID: 1234)
-            source=$(echo "$line" | sed -n 's/.*Added directory: \([^ ]*\) ->.*/\1/p')
-            target=$(echo "$line" | sed -n 's/.*-> \([^ ]]*(Worker PID:.*)\?$/\1/p')
-            # Εξαγωγή τελευταίας χρονικής στιγμής συγχρονισμού για το συγκεκριμένο source
-            last_sync=$(grep "$source" "$path" | grep "Last Sync:" | tail -n 1 | sed -n 's/.*Last Sync: \([^]]*\).*/\1/p')
-            # Εξαγωγή του τελευταίου status (STATUS: SUCCESS/ERROR/...)
-            status=$(grep "$source" "$path" | grep "STATUS:" | tail -n 1 | sed -n 's/.*STATUS: \([^ ]*\).*/\1/p')
-            if [ -z "$last_sync" ]; then last_sync="Never"; fi
-            if [ -z "$status" ]; then status="Unknown"; fi
-            echo "$source -> $target [Last Sync: $last_sync] [$status]"
+        grep "Added directory:" "$path" | while IFS= read -r line; do
+            # extract source and target using shell parameter expansion
+            src_part=${line#*Added directory: }
+            source=${src_part%% *}
+            tgt_part=${line#*-> }
+            target=${tgt_part%% *}
+            # find latest STATUS for this source
+            status=$(grep "$source" "$path" \
+                     | grep "STATUS:" \
+                     | tail -n1 \
+                     | sed -n 's/.*STATUS: *\([^ ]*\).*/\1/p')
+            [ -z "$status" ] && status="Unknown"
+            echo "$source -> $target [Status: $status]"
         done
         ;;
     listMonitored)
@@ -55,7 +53,7 @@ case "$command" in
             exit 1
         fi
         echo "Listing monitored directories:"
-        # Υποθέτουμε ότι η εμφάνιση της φράσης "Monitoring started for" σημαίνει ότι ο κατάλογος παρακολουθείται.
+        # το manager.log καταγράφει "Monitoring started for <dir>"
         grep "Monitoring started for" "$path"
         ;;
     listStopped)
@@ -64,6 +62,7 @@ case "$command" in
             exit 1
         fi
         echo "Listing stopped directories:"
+        # το console.log καταγράφει "Monitoring stopped for <dir>"
         grep "Monitoring stopped for" "$path"
         ;;
     purge)
