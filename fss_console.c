@@ -56,7 +56,7 @@ int main(int argc, char *argv[]) {
     // Open FIFO_OUT (read end) with retry
     int fifo_out_fd;
     while (1) {
-        fifo_out_fd = open(FIFO_OUT, O_RDONLY | O_NONBLOCK);
+        fifo_out_fd = open(FIFO_OUT, O_RDONLY );
         if (fifo_out_fd >= 0) break;
         if (errno == ENXIO || errno == ENOENT) {
             usleep(100000);
@@ -94,26 +94,13 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Read response
-        int total = 0;
-        while (1) {
-            int n = read(fifo_out_fd, response + total,
-                         sizeof(response) - 1 - total);
-            if (n > 0) {
-                total += n;
-                if (total >= (int)sizeof(response) - 1) break;
-                continue;
-            }
-            if (n == 0 || (n < 0 && errno == EAGAIN)) {
-                break;
-            }
+        // Read response with a single blocking read
+        ssize_t n = read(fifo_out_fd, response, sizeof(response) - 1);
+        if (n < 0) {
             perror("Error reading from " FIFO_OUT);
-            break;
-        }
-
-        if (total > 0) {
-            response[total] = '\0';
-            // Print and log response verbatim (includes timestamps)
+        } else if (n > 0) {
+            response[n] = '\0';
+            // print and log exactly what έστειλε ο manager (περιλαμβάνει timestamps και newline)
             fputs(response, stdout);
             fputs(response, console_fp);
             fflush(console_fp);
