@@ -17,8 +17,15 @@
 #define EVENT_SIZE    (sizeof(struct inotify_event))
 #define EVENT_BUF_LEN (1024 * (EVENT_SIZE + 16))
 
-// Forward declaration
+// Forward declarations
 void spawn_worker(const char *source, const char *target, const char *filename, const char *operation);
+void current_time_str(char *buffer, size_t size);
+void log_message(const char *message);
+
+// Global resources
+static FILE *log_fp = NULL;
+static int inotify_fd = -1;
+static int fifo_out_fd = -1;  // global so spawn_worker can access
 
 // --- sync_info structure ---
 typedef struct sync_info {
@@ -108,9 +115,6 @@ void remove_worker_pipe(pid_t pid) {
     }
 }
 
-// Global inotify fd for removal in remove_sync_info
-static int inotify_fd = -1;
-
 // --- sync_info helpers ---
 void add_sync_info(const char *source, const char *target) {
     sync_info_t *node = malloc(sizeof(sync_info_t));
@@ -143,7 +147,6 @@ void remove_sync_info(const char *source) {
     }
 }
 
-// update last_sync_time, error_count and last_result from exec_report
 void update_sync_info(const char *source, const char *exec_report) {
     sync_info_t *info = find_sync_info(source);
     if (!info) return;
@@ -163,8 +166,6 @@ void update_sync_info(const char *source, const char *exec_report) {
 }
 
 // --- logging & utilities ---
-static FILE *log_fp = NULL;
-
 void current_time_str(char *buffer, size_t size) {
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
@@ -174,14 +175,11 @@ void current_time_str(char *buffer, size_t size) {
 void log_message(const char *message) {
     char tbuf[32];
     current_time_str(tbuf, sizeof(tbuf));
-    fprintf(stdout, "%s %s
-", tbuf, message);
+    fprintf(stdout, "%s %s\n", tbuf, message);
     if (log_fp) {
-        fprintf(log_fp, "%s %s
-", tbuf, message);
+        fprintf(log_fp, "%s %s\n", tbuf, message);
         fflush(log_fp);
     }
-}
 }
 
 void cleanup_resources() {
@@ -189,11 +187,9 @@ void cleanup_resources() {
     unlink("fss_out");
 }
 
-// worker process count
 int worker_limit = 5;
 int current_worker_count = 0;
 
-// --- spawn_worker implementation ---
 void spawn_worker(const char *source, const char *target, const char *filename, const char *operation) {
     if (current_worker_count >= worker_limit) {
         char msg[256];
@@ -219,8 +215,7 @@ void spawn_worker(const char *source, const char *target, const char *filename, 
         close(pipefd[1]);
         current_worker_count++;
         add_worker_pipe(pid, pipefd[0], source);
-        char out[1024];
-        char tbuf[32];
+        char out[1024], tbuf[32];
         current_time_str(tbuf, sizeof(tbuf));
         snprintf(out, sizeof(out),
             "%s Added directory: %s -> %s\n"
@@ -233,7 +228,6 @@ void spawn_worker(const char *source, const char *target, const char *filename, 
     }
 }
 
-// --- SIGCHLD handler ---
 void sigchld_handler(int signo) {
     (void)signo;
     int status;
@@ -247,7 +241,6 @@ void sigchld_handler(int signo) {
     }
 }
 
-// --- main ---
 int main(int argc, char *argv[]) {
     char *logfile     = NULL;
     char *config_file = NULL;
@@ -258,27 +251,22 @@ int main(int argc, char *argv[]) {
             case 'c': config_file = optarg; break;
             case 'n': worker_limit = atoi(optarg); break;
             default:
-                fprintf(stderr, "Usage: %s -l <manager_logfile> -c <config_file> -n <worker_limit>\n", argv[0]);
+                fprintf(stderr, "Usage: %s -l <manager_logfile> -c <config_file> [-n worker_limit]\n", argv[0]);
                 exit(1);
         }
     }
     if (!logfile || !config_file) {
-        fprintf(stderr, "Logfile and config_file required\n");
-        exit(1);
+        fprintf(stderr, "Logfile and config_file required\n"); exit(1);
     }
-
     cleanup_resources();
     log_fp = fopen(logfile, "a");
     if (!log_fp) { perror("fopen log"); exit(1); }
-
     struct sigaction sa = { .sa_handler = sigchld_handler };
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     sigaction(SIGCHLD, &sa, NULL);
-
     if (mkfifo("fss_in", 0666) && errno != EEXIST) { perror("mkfifo in"); exit(1); }
     if (mkfifo("fss_out",0666) && errno != EEXIST) { perror("mkfifo out"); exit(1); }
-
     FILE *cf = fopen(config_file, "r");
     if (!cf) { perror("open config"); exit(1); }
     char line[MAX_LINE];
@@ -286,108 +274,86 @@ int main(int argc, char *argv[]) {
         char src[256], dst[256];
         if (sscanf(line, "%255s %255s", src, dst) != 2) continue;
         if (find_sync_info(src)) {
-            char m[256];
-            snprintf(m,sizeof(m),"Source %s already registered. New target rejected.", src);
-            log_message(m);
+            log_message("Source already registered. New target rejected.");
             continue;
         }
         add_sync_info(src, dst);
         spawn_worker(src, dst, "ALL", "FULL");
     }
     fclose(cf);
-
     inotify_fd = inotify_init();
     for (sync_info_t *si = sync_info_head; si; si = si->next) {
         int wd = inotify_add_watch(inotify_fd, si->source_dir, IN_CREATE|IN_MODIFY|IN_DELETE);
         if (wd < 0) perror("inotify_add_watch");
         else {
             si->inotify_watch = wd;
-            char m[256];
-            snprintf(m,sizeof(m),"Monitoring started for %s", si->source_dir);
-            log_message(m);
+            log_message("Monitoring started.");
         }
     }
-
-    int fifo_in_fd  = open("fss_in", O_RDONLY | O_NONBLOCK);
+    int fifo_in_fd = open("fss_in", O_RDONLY | O_NONBLOCK);
     if (fifo_in_fd < 0) { perror("open fss_in"); exit(1); }
     int flags = fcntl(fifo_in_fd, F_GETFL, 0);
     fcntl(fifo_in_fd, F_SETFL, flags & ~O_NONBLOCK);
-
-    int fifo_out_fd;
     do {
         fifo_out_fd = open("fss_out", O_WRONLY | O_NONBLOCK);
         if (fifo_out_fd < 0 && (errno==ENXIO||errno==ENOENT)) usleep(100000);
     } while (fifo_out_fd < 0);
-
-    char buf[1024];
-    int running = 1;
+    char buf[1024]; int running = 1;
     while (running) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(inotify_fd,  &rfds);
-        FD_SET(fifo_in_fd,  &rfds);
-        int maxfd = inotify_fd > fifo_in_fd ? inotify_fd : fifo_in_fd;
+        fd_set rfds; FD_ZERO(&rfds);
+        FD_SET(inotify_fd, &rfds); FD_SET(fifo_in_fd, &rfds);
+        int maxfd = (inotify_fd>fifo_in_fd?inotify_fd:fifo_in_fd)+1;
         for (worker_pipe_t *wp=worker_pipes; wp; wp=wp->next) {
-            FD_SET(wp->fd,&rfds);
-            if (wp->fd > maxfd) maxfd = wp->fd;
+            FD_SET(wp->fd, &rfds);
+            if (wp->fd+1 > maxfd) maxfd = wp->fd+1;
         }
-        maxfd++;
-
         if (select(maxfd, &rfds, NULL, NULL, NULL) < 0) {
-            if (errno==EINTR) continue;
-            perror("select");
-            break;
+            if (errno==EINTR) continue; perror("select"); break;
         }
-
         if (FD_ISSET(inotify_fd, &rfds)) {
-            char evbuf[EVENT_BUF_LEN];
-            int len = read(inotify_fd, evbuf, sizeof(evbuf));
+            char evbuf[EVENT_BUF_LEN]; int len = read(inotify_fd, evbuf, sizeof(evbuf));
             for (int i=0; i<len; ) {
                 struct inotify_event *e = (void*)(evbuf+i);
                 for (sync_info_t *si=sync_info_head; si; si=si->next) {
                     if (si->inotify_watch==e->wd && e->len) {
-                        const char *op = NULL;
-                        if (e->mask&IN_CREATE) op="ADDED";
-                        if (e->mask&IN_MODIFY) op="MODIFIED";
-                        if (e->mask&IN_DELETE) op="DELETED";
+                        const char *op = (e->mask&IN_CREATE)?"ADDED":
+                                         (e->mask&IN_MODIFY)?"MODIFIED":
+                                         (e->mask&IN_DELETE)?"DELETED":NULL;
                         if (op) spawn_worker(si->source_dir, si->target_dir, e->name, op);
                     }
                 }
                 i += EVENT_SIZE + e->len;
             }
         }
-
         if (FD_ISSET(fifo_in_fd, &rfds)) {
             int n = read(fifo_in_fd, buf, sizeof(buf)-1);
             if (n>0) {
-                buf[n]='\0';
-                char cmd[16], a1[256], a2[256];
-                sscanf(buf,"%15s %255s %255s",cmd,a1,a2);
-                char tbuf[32], out[1024];
+                buf[n]='\0'; char cmd[16], a1[256], a2[256]; sscanf(buf,"%15s %255s %255s",cmd,a1,a2);
+                char tbuf[32], out[1024]; sync_info_t *si;
                 if (!strcmp(cmd,"add")) {
-                    if (find_sync_info(a1)) {
-                        current_time_str(tbuf,sizeof(tbuf));
-                        snprintf(out,sizeof(out),"%s Already in queue: %s\n", tbuf, a1);
-                        write(fifo_out_fd,out,strlen(out));
-                    } else {
-                        add_sync_info(a1,a2);
-                        spawn_worker(a1,a2,"ALL","FULL");
-                        current_time_str(tbuf,sizeof(tbuf));
-                        snprintf(out,sizeof(out),
-                            "%s Added directory: %s -> %s\n"
-                            "%s Monitoring started for %s\n",
-                            tbuf, a1, a2,
-                            tbuf, a1);
-                        write(fifo_out_fd,out,strlen(out));
-                    }
+                    if (find_sync_info(a1)) { current_time_str(tbuf,sizeof(tbuf)); snprintf(out,sizeof(out),"%s Already in queue: %s\n", tbuf,a1); write(fifo_out_fd,out,strlen(out)); }
+                    else { mkdir(a1,0755); mkdir(a2,0755); add_sync_info(a1,a2); spawn_worker(a1,a2,"ALL","FULL"); }
                 }
-                // … (rest commands unchanged) …
+                else if (!strcmp(cmd,"cancel")) { si=find_sync_info(a1); current_time_str(tbuf,sizeof(tbuf)); snprintf(out,sizeof(out),"%s Monitoring stopped for %s\n",tbuf,a1); write(fifo_out_fd,out,strlen(out)); remove_sync_info(a1);} 
+                else if (!strcmp(cmd,"status")) { si=find_sync_info(a1);
+                    current_time_str(tbuf,sizeof(tbuf)); snprintf(out,sizeof(out),"%s Status requested for %s\n",tbuf,a1); write(fifo_out_fd,out,strlen(out));
+                    snprintf(out,sizeof(out),"Directory: %s\nTarget: %s\nLast Sync: %s\nErrors: %d\nStatus: %s\n",
+                        si->source_dir, si->target_dir, si->last_sync_time, si->error_count, si->active?"Active":"Not monitored"); write(fifo_out_fd,out,strlen(out)); }
+                else if (!strcmp(cmd,"sync")) { si=find_sync_info(a1); current_time_str(tbuf,sizeof(tbuf)); snprintf(out,sizeof(out),"%s Syncing directory: %s -> %s\n",tbuf,si->source_dir,si->target_dir); write(fifo_out_fd,out,strlen(out)); spawn_worker(si->source_dir, si->target_dir, "ALL", "FULL"); }
+                else if (!strcmp(cmd,"shutdown")) {
+                    const char *msgs[]={"Shutting down manager...","Waiting for all active workers to finish.","Processing remaining queued tasks.","Manager shutdown complete."};
+                    for(int i=0;i<4;i++){ current_time_str(tbuf,sizeof(tbuf)); snprintf(out,sizeof(out),"%s %s\n",tbuf,msgs[i]); write(fifo_out_fd,out,strlen(out)); }
+                    process_task_queue(); running=0;
+                }
             }
         }
-
-        // … (worker pipes handling, shutdown, etc.) …
+        for(worker_pipe_t *wp=worker_pipes; wp; wp=wp->next) if(FD_ISSET(wp->fd,&rfds)){
+            char wbuf[1024]; int r=read(wp->fd,wbuf,sizeof(wbuf)-1);
+            if(r>0){ wbuf[r]='\0'; char msg[1024]; snprintf(msg,sizeof(msg),"Worker PID %d exec_report:\n%s",wp->pid,wbuf); log_message(msg); write(fifo_out_fd,msg,strlen(msg)); update_sync_info(wp->source,wbuf);} 
+            else if(r==0) remove_worker_pipe(wp->pid);
+        }
     }
-
-    // cleanup shutdown …
+    while(current_worker_count>0) pause(); cleanup_resources(); if(log_fp) fclose(log_fp); if(fifo_out_fd>=0) close(fifo_out_fd);
     return 0;
 }
+
